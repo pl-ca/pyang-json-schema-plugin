@@ -9,6 +9,7 @@ import optparse
 import logging
 
 import json
+import ctypes
 
 from pyang import plugin
 from pyang import statements
@@ -157,21 +158,23 @@ def produce_list(stmt):
     logging.debug("in produce_list: %s %s", stmt.keyword, stmt.arg)
     arg = qualify_name(stmt)
 
-    if stmt.parent.keyword != "list":
-        result = {arg: {"type": "array", "items": []}}
-    else:
-        result = {"type": "object", "properties": {arg: {"type": "array", "items": []}}}
-
+    list_obj = dict()
     if hasattr(stmt, 'i_children'):
         for child in stmt.i_children:
             if child.keyword in producers:
                 logging.debug("keyword hit on: %s %s", child.keyword, child.arg)
                 if stmt.parent.keyword != "list":
-                    result[arg]["items"].append(producers[child.keyword](child))
+                    list_obj.update(producers[child.keyword](child))
                 else:
-                    result["properties"][arg]["items"].append(producers[child.keyword](child))
+                    list_obj.update(producers[child.keyword](child))
             else:
                 logging.debug("keyword miss on: %s %s", child.keyword, child.arg)
+
+    if stmt.parent.keyword != "list":
+        result = {arg: { "type": "array", "items": [ {"required": [ stmt.i_key[0].arg ], "type": "object", "properties" : list_obj} ]}}
+    else:
+        result = {"type": "object", "properties": {arg: {"type": "array", "items": [ {"required": [ stmt.i_key[0].arg ], "type": "object", "properties" : list_obj} ]}}}
+
     logging.debug("In produce_list for %s, returning %s", stmt.arg, result)
     return result
 
@@ -194,19 +197,13 @@ def produce_container(stmt):
     logging.debug("in produce_container: %s %s", stmt.keyword, stmt.arg)
     arg = qualify_name(stmt)
 
-    if stmt.parent.keyword != "list":
-        result = {arg: {"type": "object", "properties": {}}}
-    else:
-        result = {"type": "object", "properties": {arg:{"type": "object", "properties": {}}}}
+    result = {arg: {"type": "object", "properties": {}}}
 
     if hasattr(stmt, 'i_children'):
         for child in stmt.i_children:
             if child.keyword in producers:
                 logging.debug("keyword hit on: %s %s", child.keyword, child.arg)
-                if stmt.parent.keyword != "list":
-                    result[arg]["properties"].update(producers[child.keyword](child))
-                else:
-                    result["properties"][arg]["properties"].update(producers[child.keyword](child))
+                result[arg]["properties"].update(producers[child.keyword](child))
             else:
                 logging.debug("keyword miss on: %s %s", child.keyword, child.arg)
     logging.debug("In produce_container, returning %s", result)
@@ -247,34 +244,47 @@ producers = {
     "choice":       produce_choice,
 }
 
+# From https://stackoverflow.com/a/52485502
+def limits(c_int_type):
+    signed = c_int_type(-1).value < c_int_type(0).value
+    bit_size = ctypes.sizeof(c_int_type) * 8
+    signed_limit = 2 ** (bit_size - 1)
+    return (-signed_limit, signed_limit - 1) if signed else (0, 2 * signed_limit - 1)
+
 _numeric_type_trans_tbl = {
     # https://tools.ietf.org/html/draft-ietf-netmod-yang-json-02#section-6
-    "int8": ("number", None),
-    "int16": ("number", None),
-    "int32": ("number", "int32"),
-    "int64": ("integer", "int64"),
-    "uint8": ("number", None),
-    "uint16": ("number", None),
-    "uint32": ("integer", "uint32"),
-    "uint64": ("integer", "uint64")
+    "int8": ("integer", ctypes.c_int8),
+    "int16": ("integer", ctypes.c_int16),
+    "int32": ("integer", ctypes.c_int32),
+    "int64": ("integer", ctypes.c_int64),
+    "uint8": ("integer", ctypes.c_uint8),
+    "uint16": ("integer", ctypes.c_uint16),
+    "uint32": ("integer", ctypes.c_uint32),
+    "uint64": ("integer", ctypes.c_uint64)
     }
 
 def numeric_type_trans(dtype):
     trans_type = _numeric_type_trans_tbl[dtype][0]
     # Should include format string in return value
     # tformat = _numeric_type_trans_tbl[dtype][1]
-    return {"type": trans_type}
+    lim = limits(_numeric_type_trans_tbl[dtype][1])
+    return {"minimum": lim[0], "type": trans_type, "maximum": lim[1] }
 
 def string_trans(stmt):
     logging.debug("in string_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    result = {"type": "string"}
+    pattern = stmt.search('pattern')
+    if pattern is not None and len(pattern) > 0:
+        result = {"pattern": pattern[0].arg, "type": "string"}
+    else:
+        result = {"type": "string"}
+
     return result
 
 def enumeration_trans(stmt):
     logging.debug("in enumeration_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    result = {"properties": {"type": {"enum": []}}}
+    result = {"enum": []}
     for enum in stmt.search("enum"):
-        result["properties"]["type"]["enum"].append(enum.arg)
+        result["enum"].append(enum.arg)
     logging.debug("In enumeration_trans for %s, returning %s", stmt.arg, result)
     return result
 
@@ -310,8 +320,11 @@ def instance_identifier_trans(stmt):
 
 def leafref_trans(stmt):
     logging.debug("in leafref_trans with stmt %s %s", stmt.keyword, stmt.arg)
-    # TODO: Need to resolve i_leafref_ptr here 
-    result = {"type": "string"}
+    return produce_type(stmt.parent.i_leafref.i_target_node.search_one('type'))
+
+def identityref_trans(stmt):
+    logging.debug("in identityref_trans with stmt %s %s", stmt.keyword, stmt.arg)
+    result = {"type": "identityref"}
     return result
 
 _other_type_trans_tbl = {
@@ -323,7 +336,8 @@ _other_type_trans_tbl = {
     "empty":                    empty_trans,
     "union":                    union_trans,
     "instance-identifier":      instance_identifier_trans,
-    "leafref":                  leafref_trans
+    "leafref":                  leafref_trans,
+    "identityref":              identityref_trans
 }
 
 def other_type_trans(dtype, stmt):
